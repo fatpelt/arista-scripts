@@ -1,0 +1,28 @@
+configs:
+- config:
+  - description Phone
+  - switchport trunk native vlan 10
+  - switchport phone vlan 40
+  - switchport phone trunk untagged
+  - switchport mode trunk phone
+  macs:
+  - 0c:7d:71
+  - 00:04:f2
+- config:
+  - description AP1
+  - switchport trunk native vlan 40
+  - switchport trunk allowed vlan 10,40,51
+  - switchport mode trunk
+  macs:
+  - 0c:7d:71:e5:41:01
+  - 00:11:74
+  - 30-B6-2D
+  - 88b1.e1
+  - E4D1.24
+  - E4D1.2400.1234
+- config:
+  - description UserPort
+  - switchport mode access
+  - switchport access vlan 10
+  macs:
+  - '*'
