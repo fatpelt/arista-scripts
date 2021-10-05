@@ -12,9 +12,8 @@ import argparse
 import sys
 from jsonrpclib import Server
 import ssl
-import collections
 import os
-import time
+import yaml, json
 
 try:
     _create_unverified_https_context = ssl._create_unverified_context
@@ -30,6 +29,7 @@ apply_default_config = False
 
 def main():
     parser = argparse.ArgumentParser(description='Auto Port Config')
+    parser.add_argument('-d', '--debug', action='store_true', help='output debug statements')
 
     interfaceInfo = parser.add_mutually_exclusive_group(required=True)
 
@@ -39,83 +39,69 @@ def main():
     parser.add_argument('-c', action='store', dest='config', default=dir_path + '/auto-port.conf', help='File containting the ouis and config to apply. Default is auto-port.conf in same dir as script')
     parser.add_argument('-a', action='store', dest='address', help='The username password and address to the switch. username:password@ipaddress')
 
-    results = parser.parse_args()
+    global options
+    options = parser.parse_args()
 
-    if results.address:
+    if options.address:
         global switch 
-        switch = Server("https://{}/command-api".format(results.address))
+        switch = Server("https://{}/command-api".format(options.address))
 
+    configs = parse_config_file(options.config)
+    if configs == None:
+        print("Could not successfully parse the configuration file")
+        quit()
 
-    ouis = []
-    interface_config = []
+    specificConfig = check_interface_macs(options.inter, configs)
+    if specificConfig == None:
+        # no configuration to apply was found.  we can terminate
+        quit()
 
-    parse_config_file(results.config, ouis, interface_config)
-    
+    # Check if the interface config matches the proposed config
+    if check_interface_config(options.inter, specificConfig):
+        quit()
 
-    mac_index = check_interface_macs(results.inter, ouis)
+    config_interface(specificConfig, options.inter)
 
-    if mac_index != -99 and apply_default_config:
-        # Check if the interface config matches the purposed config or if there is a default config, quit if it does.
-        if check_interface_config(results.inter, interface_config[mac_index]) and not apply_default_config:
-            quit()
+def parse_config_file(_config_file):
+    """Parses the proposed configuration file
 
-        config_interface(interface_config[mac_index], results.inter)
-
-
-def parse_config_file(_config_file, _ouis, _interface_config):
-    """Parses the purposed configuration file
-
-    If the default wildcard is used then the global variable apply_default_config is set to True
-    This will apply a default config to a interface. If not used then we ignore an interface that doesn't match
+    this function will first attempt to parse the config as yaml
+    should that fail it will try parsing as json
 
     Parameters
     ----------
     _config_file : str
         Path to the configuration file
-    _ouis : array of lists
-        All of the ouis or mac addresses. Each section is a index of the array stored in a list
-    _interface_config : array of lists
-        The config for the matching interfaces. Each config section is a index of the array stored in a list
 
+    Result:
+    -------
+
+    Returns None if the config is not available or parseable, or returns
+    a dict of the configuration
     """
-
-    file = open(_config_file, "r")
-    line = file.readline()
-
-    while line:
-        oui = []
-        cmds = []
-
-        while line:
-            if line == '\n':
-                break
-            if line == "%DEFAULT%\n":
-                global apply_default_config
-                apply_default_config = True
-
-            oui.append(clean_mac_address(line))    
-            line = file.readline()
-
-        _ouis.append(oui)    
-        line = file.readline()
-
-        while line:
-            if line == '\n':
-                break
-
-            cmds.append(line.strip())    
-            line = file.readline()
-
-        _interface_config.append(cmds)
-
-        line = file.readline() 
  
-    file.close()
+    configs = None
+    with open(_config_file, "r") as config_file:
+        # let's try to parse this as yml first.  if that fails, let's try json
+        try:
+            configs = yaml.safe_load(config_file)
+            if options.debug:
+                print(" - configuration parsed as YAML")
+        except:
+            try:
+                configs = json.load(config_file)
+                if options.debug:
+                    print(" - configuration parsed as JSON")
+            except:
+                if options.debug:
+                    print(" - configuration was not parsed")
+
+    return configs
 
 """
 
 """
-def check_interface_macs(_interface, _ouis):
+def check_interface_macs(_interface, configs):
     """Checks to see if any OUIs or mac addresses are located on an interface
 
     Pulls all mac address from the mac address table for an interface. 
@@ -124,38 +110,58 @@ def check_interface_macs(_interface, _ouis):
     ----------
     _interface : str
         The interface to check
-    _ouis : array of lists
-        All of the ouis or mac addresses. Each section is a index of the array stored in a list
+    configs : the global parsed configuration
 
     Returns
     ----------
-    The index of the array in which the OUI or mac address matches from the _oui array.
-    Will return a -99 if no mac address, OUI or not using a default config.
+    The entry from the configuration where the match exists is returned,
+    or None if there wasn't a default or match
+
+    This is not a well optimized algorithm.  search each mac address through the    parsed config and stop once we either find an exact match or an oui match.      we'll be looping over the config for each mac on an interface.  generally
+    this is a small list, however it may be large depending on what is on a
+    port.  we'll do this string wise.  unfortunately we'll match the first
+    exact match, but the last oui match if there is overlap
     """
 
-    mac_addresses = []
+    specificMatch = None
+    ouiMatch = None
+    defaultMatch = None
 
     response = runCMD(["show mac address-table interface " + _interface])
+    if options.debug:
+        print(response)
 
     for mac_address in response[1]['unicastTable']['tableEntries']:
+        mac_address = clean_mac_address(mac_address['macAddress'])
+        interfaceOUI = mac_address[0:6]
 
-        mac_addresses.append(clean_mac_address(mac_address['macAddress']).encode("utf-8"))
-    
-    for index, ouis in enumerate(_ouis):
-        # Search for more specific mac address first
-        if any(item in mac_addresses for item in ouis):
-            return index
+        if options.debug:
+            print(" mac_address: {}, interfaceOUI: {}".format(mac_address, interfaceOUI))
 
-        for oui in ouis:
-            if any([ mac.startswith(oui) for mac in mac_addresses]):
-                return index
+        # search for this mac in and oui in each entry of the config
+        for config in configs['configs']:
+            for mac in config['macs']:
+                mac = clean_mac_address(mac)
+                if mac == "*":
+                    if options.debug:
+                        print(" - found a default section")
+                    defaultMatch = config
+                if interfaceOUI == mac:
+                    if options.debug:
+                        print(" - found an oui section")
+                    ouiMatch = config
+                if mac_address == mac:
+                    if options.debug:
+                       print(" - found a specific match")
+                    # if this is a specific match we can terminate and skip
+                    #  any further checks.
+                    return config
 
-    if apply_default_config:
-        if any(item in ["%default%"] for item in ouis):
-            return index
-
-    return -99
-
+        if ouiMatch != None:
+            return ouiMatch
+        else:
+            return defaultMatch
+            
 def check_interface_config(_interface, _int_config):
     """Checks to see if the interface already has the correct config
 
@@ -178,7 +184,14 @@ def check_interface_config(_interface, _int_config):
     config = [line.strip().encode("utf-8") for line in config if line]
     del config[:1]
 
-    return set(config) == set(_int_config)
+    if set(config) == set(_int_config['config']):
+        if options.debug:
+            print(" - Configuration looks to be what we're wanting")
+        return True
+    else:
+        if options.debug:
+            print(" - Configuration is not what we want")
+        return False
 
 def config_interface(_config, _interface):
     """Sets up command to send to the switch to configure the interface.
@@ -192,7 +205,10 @@ def config_interface(_config, _interface):
 
     """
 
-    runCMD(["configure", "default interface " + _interface, "interface " + _interface] + _config)
+    if options.debug:
+        print(" - setting the configuration")
+
+    runCMD(["configure", "default interface " + _interface, "interface " + _interface] + _config['config'])
 
 
 def clean_mac_address(mac):
@@ -227,9 +243,13 @@ def runCMD(_cmd, _format='json'):
     """
 
     try:
+        if options.debug:
+            print(" - running the following commands")
+            print(_cmd)
+
         return switch.runCmds( version = 1, cmds = ["enable"] + _cmd, format=_format)
-    except:
-        print("Error with connecting to switch! Please try again.")
+    except Exception as e:
+        print("Error with connecting to switch! Please try again.", e)
         quit()
 
 if __name__ == "__main__":
